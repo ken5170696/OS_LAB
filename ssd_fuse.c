@@ -314,7 +314,7 @@ static int ssd_read(const char* path, char* buf, size_t size,
 }
 static int ssd_do_write(const char* buf, size_t size, off_t offset)
 {
-    /*  TODO: only basic write case, need to consider other cases */
+    /*  TODO: Handle unaligned writes and consider other cases */
     
     printf("=== ssd do write ===\n");
     
@@ -335,33 +335,31 @@ static int ssd_do_write(const char* buf, size_t size, off_t offset)
     curr_size = 0;
     for (idx = 0; idx < tmp_lba_range; idx++)
     {
-        /*  example only align 512, need to implement other cases  */
-        if(offset % 512 == 0 && size % 512 == 0)
+        /*  Handle unaligned writes by aligning to 512  */
+        int align_size = 512 - (offset % 512);
+        int block_size = (remain_size < align_size) ? remain_size : align_size;
+
+        rst = ftl_write(buf + process_size, block_size / 512, tmp_lba + idx);
+        if ( rst == 0 )
         {
-            rst = ftl_write(buf + process_size, 1, tmp_lba + idx);
-            if ( rst == 0 )
-            {
-                //write full return -enomem;
-                return -ENOMEM;
-            }
-            else if (rst < 0)
-            {
-                //error
-                return rst;
-            }
-            curr_size += 512;
-            remain_size -= 512;
-            process_size += 512;
-            offset += 512;
+            //write full, return -enomem;
+            return -ENOMEM;
         }
-        else{
-            printf(" --> Not align 512 !!!");
-            return -EINVAL;
+        else if (rst < 0)
+        {
+            //error
+            return rst;
         }
+
+        curr_size += block_size;
+        remain_size -= block_size;
+        process_size += block_size;
+        offset += block_size;
     }
 
     return size;
 }
+
 static int ssd_write(const char* path, const char* buf, size_t size,
                      off_t offset, struct fuse_file_info* fi)
 {
