@@ -316,7 +316,7 @@ static int ssd_do_write(const char* buf, size_t size, off_t offset)
 {
     /*  TODO: Handle unaligned writes and consider other cases */
     
-    printf("=== ssd do write ===\n");
+    printf("\n\n=== ssd do write ===\n");
     
     int tmp_lba, tmp_lba_range, process_size;
     int idx, curr_size, remain_size, rst;
@@ -335,11 +335,18 @@ static int ssd_do_write(const char* buf, size_t size, off_t offset)
     curr_size = 0;
     for (idx = 0; idx < tmp_lba_range; idx++)
     {
+    	
         /*  Handle unaligned writes by aligning to 512  */
         int align_size = 512 - (offset % 512);
         int block_size = (remain_size < align_size) ? remain_size : align_size;
+        
+	// Create a temporary buffer to hold the aligned data
+        char aligned_buf[512] = {'\0'};
 
-        rst = ftl_write(buf + process_size, block_size / 512, tmp_lba + idx);
+        // Copy the data from the input buffer to the aligned buffer
+        memcpy(aligned_buf + (offset % 512), buf + process_size, block_size);
+
+        rst = ftl_write(aligned_buf, 1, tmp_lba + idx);
         if ( rst == 0 )
         {
             //write full, return -enomem;
@@ -355,6 +362,16 @@ static int ssd_do_write(const char* buf, size_t size, off_t offset)
         remain_size -= block_size;
         process_size += block_size;
         offset += block_size;
+        
+        fflush(stdout);
+    	printf(">>> round %d result\n",idx);
+    	printf("align_size: %d\n", curr_size);
+    	printf("block_size: %d\n", curr_size);
+    	printf("curr_size: %d\n", curr_size);
+    	printf("remain_size: %d\n", remain_size);
+    	printf("process_size: %d\n", process_size);
+    	printf("offset: %ld\n", offset);
+    	printf(">>> round result end\n\n");
     }
 
     return size;
