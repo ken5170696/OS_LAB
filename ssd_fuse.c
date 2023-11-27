@@ -153,12 +153,11 @@ static int nand_erase(int block)
 
 static unsigned int get_next_pca()
 {
-    /*  TODO: seq A, need to change to seq B */
-	
     if (curr_pca.pca == INVALID_PCA)
     {
         //init
         curr_pca.pca = 0;
+        printf("PCA = page %d, nand %d\n", curr_pca.fields.page, curr_pca.fields.block);
         return curr_pca.pca;
     }
     else if (curr_pca.pca == FULL_PCA)
@@ -167,14 +166,12 @@ static unsigned int get_next_pca()
         printf("No new PCA\n");
         return FULL_PCA;
     }
-
-    if ( curr_pca.fields.block == PHYSICAL_NAND_NUM - 1)
+    if ( curr_pca.fields.page == NAND_SIZE_KB * (1024 / 512) -1 )
     {
-        curr_pca.fields.page += 1;
+        curr_pca.fields.block += 1;
     }
-    curr_pca.fields.block = (curr_pca.fields.block + 1 ) % PHYSICAL_NAND_NUM;
-
-    if ( curr_pca.fields.page >= (NAND_SIZE_KB * 1024 / 512) )
+    curr_pca.fields.page = (curr_pca.fields.page + 1) % (NAND_SIZE_KB * (1024 / 512));
+    if ( curr_pca.fields.block >= PHYSICAL_NAND_NUM) 
     {
         printf("No new PCA\n");
         curr_pca.pca = FULL_PCA;
