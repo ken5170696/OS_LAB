@@ -371,12 +371,9 @@ static int ssd_read(const char* path, char* buf, size_t size,
     }
     return ssd_do_read(buf, size, offset);
 }
-static int ssd_do_write(const char* buf, size_t size, off_t offset)
+static int ssd_do_write(const char *buf, size_t size, off_t offset)
 {
-    /*  TODO: Handle unaligned writes and consider other cases */
-    
-    printf("\n\n=== ssd do write ===\n");
-    
+    /*  TODO: only basic write case, need to consider other cases */
     int tmp_lba, tmp_lba_range, process_size;
     int idx, curr_size, remain_size, rst;
 
@@ -388,39 +385,94 @@ static int ssd_do_write(const char* buf, size_t size, off_t offset)
 
     tmp_lba = offset / 512;
     tmp_lba_range = (offset + size - 1) / 512 - (tmp_lba) + 1;
-
     process_size = 0;
     remain_size = size;
+    if (*(buf + remain_size - 1) == '\n')
+        remain_size--;
     curr_size = 0;
+
+    // consider case:
+    //   [x] 1. offset align 512 && input size align 512 (sample code)
+    //   [x] 2. offset align 512 && input size "not" align 512 (yuchen)
+    //   [x] 3. offset "not" align 512 && input size align 512
+    //   [x] 4. offset "not" align 512 && input size "not" align 512
+
+    // process flow:
+    //   if size || offset not align 512, should read the data from nand and overwrite it
+    char alignBuf[512] = {'\0'};
+
     for (idx = 0; idx < tmp_lba_range; idx++)
     {
-    	
-        /*  Handle unaligned writes by aligning to 512  */
-        int align_size = 512 - (offset % 512);
-        int block_size = (remain_size < align_size) ? remain_size : align_size;
-        
-	    // Create a temporary buffer to hold the aligned data
-        char aligned_buf[512] = {'\0'};
+        /*  example only align 512, need to implement other cases  */
 
-        // Copy the data from the input buffer to the aligned buffer
-        memcpy(aligned_buf + (offset % 512), buf + process_size, block_size);
-
-        rst = ftl_write(aligned_buf, 1, tmp_lba + idx);
-        if ( rst == 0 )
+        if (offset % 512 == 0)
         {
-            //write full, return -enomem;
-            return -ENOMEM;
+            printf(">>>>> ssd_do_write Case 1\n");
+            if (!ftl_read(alignBuf, tmp_lba)) // LBA space is clear
+            {
+                rst = ftl_write(buf + process_size, 1, tmp_lba + idx);
+            }
+            else
+            {
+                if (remain_size > 512)
+                    memcpy(&alignBuf, buf + process_size, 512);
+                else
+                    memcpy(&alignBuf, buf + process_size, remain_size);
+                rst = ftl_write(alignBuf, 1, tmp_lba + idx);
+            }
+            if (rst == 0)
+            {
+                // write full return -enomem;
+                return -ENOMEM;
+            }
+            else if (rst < 0)
+            {
+                // error
+                return rst;
+            }
+            curr_size += 512;
+            remain_size -= 512;
+            process_size += 512;
+            offset += 512;
         }
-        else if (rst < 0)
+        else if (offset % 512 != 0)
         {
-            //error
-            return rst;
-        }
+            ftl_read(alignBuf, tmp_lba);
+            int offset_in_lba = offset % 512;
+            if ((offset + remain_size) / 512 == tmp_lba) // all in same lba page
+            {
+                printf(">>>>> ssd_do_write Case 2\n");
+                memcpy(alignBuf + offset_in_lba, buf, remain_size);
+                rst = ftl_write(alignBuf, 1, tmp_lba + idx);
+            }
+            else
+            {
+                printf(">>>>> ssd_do_write Case 3\n");
+                memcpy(alignBuf + offset_in_lba, buf, 512 - offset_in_lba);
+                rst = ftl_write(alignBuf, 1, tmp_lba + idx);
+            }
+            
 
-        curr_size += block_size;
-        remain_size -= block_size;
-        process_size += block_size;
-        offset += block_size;
+            if (rst == 0)
+            {
+                // write full return -enomem;
+                return -ENOMEM;
+            }
+            else if (rst < 0)
+            {
+                // error
+                return rst;
+            }
+            curr_size += 512;
+            remain_size -= (512 - offset_in_lba);
+            process_size += (512 - offset_in_lba);
+            offset += (512 - offset_in_lba);
+        }
+        else
+        {
+            printf(" --> Something Wrong at ssd_do_write function...\n");
+            return -EINVAL;
+        }
     }
 
     return size;
