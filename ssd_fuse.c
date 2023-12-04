@@ -22,6 +22,13 @@ enum
     SSD_FILE,
 };
 
+typedef enum 
+{
+    PAGE_FREE = 0,
+    PAGE_VALID = 1,
+    PAGE_INVALID = 2,
+
+} PAGE_INFO;
 
 static size_t physic_size;
 static size_t logic_size;
@@ -42,6 +49,39 @@ union pca_rule
 PCA_RULE curr_pca;
 
 unsigned int* L2P;
+
+PAGE_INFO** INFO_TABLE;
+
+
+static int print_info_table(){
+
+    printf("=== info table ===\n");
+    for(int i = 0; i < PHYSICAL_NAND_NUM; i++){
+        for(int j = 0; j < NAND_SIZE_KB * 1024 / 512; j++){
+            switch (INFO_TABLE[i][j])
+            {
+            case PAGE_FREE:
+                printf("F ");
+                break;
+
+            case PAGE_VALID:
+                printf("V ");
+                break;
+
+            case PAGE_INVALID:
+                printf("I ");
+                break;
+            
+            default:
+                printf("%d ", INFO_TABLE[i][j]);
+                break;
+            }
+        }
+        printf("\n");
+    }
+    printf("=== info table end ===\n");
+    return 0;
+}
 
 static int ssd_resize(size_t new_size)
 {
@@ -201,12 +241,34 @@ static int ftl_read( char* buf, size_t lba)
 static int ftl_write(const char* buf, size_t lba_rnage, size_t lba)
 {
     /*  TODO: only basic write case, need to consider other cases */
-    PCA_RULE pca;
-    pca.pca = get_next_pca();
+    PCA_RULE newPca;
+    newPca.pca = get_next_pca();
 
-    if (nand_write( buf, pca.pca) > 0)
+
+    if (nand_write( buf, newPca.pca) > 0)
     {
-        L2P[lba] = pca.pca;
+        // get old pca
+        PCA_RULE oldPca;
+        oldPca.pca = L2P[lba];
+
+        printf("old.pca %d: block %d, page %d.\n", oldPca.pca, oldPca.fields.block, oldPca.fields.page);
+
+        // if old pca != -1 and old lba is valid
+        if(oldPca.pca != -1 && 
+            INFO_TABLE[oldPca.fields.block][oldPca.fields.page] == PAGE_VALID
+        ){
+            // Set old page to invalid.
+            INFO_TABLE[oldPca.fields.block][oldPca.fields.page] = PAGE_INVALID;
+        }
+
+        // Update L2P Table.
+        L2P[lba] = newPca.pca;
+
+        // Set new page to valid.
+        INFO_TABLE[newPca.fields.block][newPca.fields.page] = PAGE_VALID;
+
+        print_info_table();
+
         return 512 ;
     }
     else
@@ -337,7 +399,7 @@ static int ssd_do_write(const char* buf, size_t size, off_t offset)
         int align_size = 512 - (offset % 512);
         int block_size = (remain_size < align_size) ? remain_size : align_size;
         
-	// Create a temporary buffer to hold the aligned data
+	    // Create a temporary buffer to hold the aligned data
         char aligned_buf[512] = {'\0'};
 
         // Copy the data from the input buffer to the aligned buffer
@@ -359,16 +421,6 @@ static int ssd_do_write(const char* buf, size_t size, off_t offset)
         remain_size -= block_size;
         process_size += block_size;
         offset += block_size;
-        
-        fflush(stdout);
-    	printf(">>> round %d result\n",idx);
-    	printf("align_size: %d\n", curr_size);
-    	printf("block_size: %d\n", curr_size);
-    	printf("curr_size: %d\n", curr_size);
-    	printf("remain_size: %d\n", remain_size);
-    	printf("process_size: %d\n", process_size);
-    	printf("offset: %ld\n", offset);
-    	printf(">>> round result end\n\n");
     }
 
     return size;
@@ -449,6 +501,7 @@ static const struct fuse_operations ssd_oper =
     .write          = ssd_write,
     .ioctl          = ssd_ioctl,
 };
+
 int main(int argc, char* argv[])
 {
     int idx;
@@ -460,6 +513,13 @@ int main(int argc, char* argv[])
     curr_pca.pca = INVALID_PCA;
     L2P = malloc(LOGICAL_NAND_NUM * NAND_SIZE_KB * 1024 / 512 * sizeof(int));
     memset(L2P, INVALID_PCA, sizeof(int)*LOGICAL_NAND_NUM * NAND_SIZE_KB * 1024 / 512);
+
+    // Info Table init
+    INFO_TABLE = malloc(PHYSICAL_NAND_NUM * sizeof(PAGE_INFO*));
+    for(int i = 0; i < PHYSICAL_NAND_NUM; i++){
+        INFO_TABLE[i] = malloc(NAND_SIZE_KB * 1024 / 512 * sizeof(PAGE_INFO));
+        memset(INFO_TABLE[i], PAGE_FREE, NAND_SIZE_KB * 1024 / 512 * sizeof(PAGE_INFO));
+    }
 
     //create nand file
     for (idx = 0; idx < PHYSICAL_NAND_NUM; idx++)
