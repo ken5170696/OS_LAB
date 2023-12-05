@@ -15,6 +15,9 @@
 #define FULL_PCA     (0xFFFFFFFE)
 #define NAND_LOCATION  "/home/vboxuser/Desktop/OS_LAB"
 
+#define GC_NAND_NUM (1)
+#define MAX_PAGE_NUM (NAND_SIZE_KB * (1024 / 512))
+
 enum
 {
     SSD_GET_LOGIC_SIZE   = _IOR('E', 0, size_t),

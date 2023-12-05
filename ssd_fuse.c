@@ -15,6 +15,11 @@
 #include <errno.h>
 #include "ssd_fuse_header.h"
 #define SSD_NAME       "ssd_file"
+
+static unsigned int gc();
+static int ftl_read( char* buf, size_t lba);
+static int ftl_write(const char* buf, size_t lba_rnage, size_t lba);
+
 enum
 {
     SSD_NONE,
@@ -50,14 +55,26 @@ PCA_RULE curr_pca;
 
 unsigned int* L2P;
 
-PAGE_INFO** INFO_TABLE;
+int** INFO_TABLE;
+int** P2L;
 
+PCA_RULE curr_gc_pca;
+
+static int get_valid_num(int blockIdx){
+    int valid_num = 0;
+    for(int pageIdx = 0; pageIdx < MAX_PAGE_NUM; pageIdx++){
+        if(INFO_TABLE[blockIdx][pageIdx] == PAGE_VALID){
+            valid_num++;
+        }
+    }
+    return valid_num;
+}
 
 static int print_info_table(){
 
     printf("=== info table ===\n");
     for(int i = 0; i < PHYSICAL_NAND_NUM; i++){
-        for(int j = 0; j < NAND_SIZE_KB * 1024 / 512; j++){
+        for(int j = 0; j < MAX_PAGE_NUM; j++){
             switch (INFO_TABLE[i][j])
             {
             case PAGE_FREE:
@@ -206,22 +223,186 @@ static unsigned int get_next_pca()
         printf("No new PCA\n");
         return FULL_PCA;
     }
-    if ( curr_pca.fields.page == NAND_SIZE_KB * (1024 / 512) -1 )
+    if ( curr_pca.fields.page == MAX_PAGE_NUM -1 )
     {
-        curr_pca.fields.block += 1;
+        curr_pca.fields.block = (curr_pca.fields.block + 1) % (PHYSICAL_NAND_NUM - GC_NAND_NUM);
     }
-    curr_pca.fields.page = (curr_pca.fields.page + 1) % (NAND_SIZE_KB * (1024 / 512));
-    if ( curr_pca.fields.block >= PHYSICAL_NAND_NUM) 
+    curr_pca.fields.page = (curr_pca.fields.page + 1) % MAX_PAGE_NUM;
+    if ( curr_pca.fields.block == curr_gc_pca.fields.block ||
+            INFO_TABLE[curr_pca.fields.block][curr_pca.fields.page] == PAGE_VALID ||
+            INFO_TABLE[curr_pca.fields.block][curr_pca.fields.page] == PAGE_INVALID) 
     {
-        printf("No new PCA\n");
-        curr_pca.pca = FULL_PCA;
-        return FULL_PCA;
+        printf("No new PCA: gc\n");
+        curr_pca.pca = gc();
+        print_info_table();
+        return curr_pca.pca;
     }
     else
     {
         printf("PCA = page %d, nand %d\n", curr_pca.fields.page, curr_pca.fields.block);
         return curr_pca.pca;
     }
+}
+
+static unsigned int gc() {
+
+    printf("=== gc start ===\n");
+
+    // init gc_pca
+    PCA_RULE gc_pca;
+    gc_pca.fields.block = curr_gc_pca.fields.block;
+    gc_pca.fields.page = 0;
+
+    PCA_RULE tmp_pca;
+
+    int isBlockHasValid[PHYSICAL_NAND_NUM - GC_NAND_NUM] = {0};
+    int valid_num[PHYSICAL_NAND_NUM - GC_NAND_NUM] = {0};
+    int valid_num_idx[PHYSICAL_NAND_NUM - GC_NAND_NUM] = {0};
+
+    // update valid_num
+    printf("=== update valid_num ===\n");
+    for(int blockIdx = 0; blockIdx < PHYSICAL_NAND_NUM - GC_NAND_NUM; blockIdx++){
+        valid_num_idx[blockIdx] = blockIdx;
+        valid_num[blockIdx] = get_valid_num(blockIdx);
+    }
+
+    // sort valid_num
+    printf("=== sort valid_num ===\n");
+    for(int i = 0; i < PHYSICAL_NAND_NUM - GC_NAND_NUM; i++){
+        for(int j = i + 1; j < PHYSICAL_NAND_NUM - GC_NAND_NUM; j++){
+            if(valid_num[i] > valid_num[j]){
+                int tmp = valid_num[i];
+                valid_num[i] = valid_num[j];
+                valid_num[j] = tmp;
+
+                tmp = valid_num_idx[i];
+                valid_num_idx[i] = valid_num_idx[j];
+                valid_num_idx[j] = tmp;
+            }
+        }
+    }
+    
+    // move data to gc_pca by valid_num_idx
+    printf("=== move data to gc_pca by valid_num_idx ===\n");
+    for(int blockIdx = 0; blockIdx < PHYSICAL_NAND_NUM - GC_NAND_NUM; blockIdx++){
+        for(int pageIdx = 0; pageIdx < MAX_PAGE_NUM; pageIdx++){
+            if(INFO_TABLE[valid_num_idx[blockIdx]][pageIdx] == PAGE_VALID){
+                printf("> %d - %d to gc page %d\n", valid_num_idx[blockIdx], pageIdx, gc_pca.fields.page);
+
+                tmp_pca.fields.block = valid_num_idx[blockIdx];
+                tmp_pca.fields.page = pageIdx;
+
+                // copy data from valid_num_idx
+                char buf[512] = {'\0'};
+                nand_read(buf, tmp_pca.pca);
+                nand_write(buf, gc_pca.pca);
+                
+                // update L2P and P2L
+                P2L[gc_pca.fields.block][gc_pca.fields.page] = P2L[valid_num_idx[blockIdx]][pageIdx];
+                P2L[valid_num_idx[blockIdx]][pageIdx] = -1;
+                L2P[P2L[gc_pca.fields.block][gc_pca.fields.page]] = gc_pca.pca;
+                
+                // update info table
+                INFO_TABLE[gc_pca.fields.block][gc_pca.fields.page] = PAGE_VALID;
+                INFO_TABLE[valid_num_idx[blockIdx]][pageIdx] = PAGE_INVALID;
+
+                // update gc_pca
+                gc_pca.fields.page = (gc_pca.fields.page + 1 ) % MAX_PAGE_NUM;
+
+                if(gc_pca.fields.page == 0){
+                    printf("> gc_pca is full\n");
+                    break;
+                }
+
+                print_info_table();
+            }
+        }
+    }
+
+    // find block which pages are all invalid
+    printf("=== find block which pages are all invalid ===\n");
+    for(int blockIdx = 0; blockIdx < PHYSICAL_NAND_NUM - GC_NAND_NUM; blockIdx++){
+        for(int pageIdx = 0; pageIdx < MAX_PAGE_NUM; pageIdx++){
+            if(INFO_TABLE[blockIdx][pageIdx] == PAGE_VALID){
+                isBlockHasValid[blockIdx] = 1;
+                break;
+            }
+        }
+    }
+
+    // erase block which pages are all invalid, update info table
+    printf("=== erase block which pages are all invalid, update info table ===\n");
+    for(int blockIdx = 0; blockIdx < PHYSICAL_NAND_NUM - GC_NAND_NUM; blockIdx++){
+        if(isBlockHasValid[blockIdx] == 0){
+            //printf("> erase block %d\n", blockIdx);
+            nand_erase(blockIdx);
+
+            // update info table
+            //printf("> update info table\n");
+            for(int pageIdx = 0; pageIdx < MAX_PAGE_NUM; pageIdx++){
+                INFO_TABLE[blockIdx][pageIdx] = PAGE_FREE;
+            }
+
+            // update L2P table
+            //printf("> update L2P table\n");
+            // for(int pageIdx = 0; pageIdx < MAX_PAGE_NUM; pageIdx++){
+            //     L2P[blockIdx * MAX_PAGE_NUM + pageIdx] = INVALID_PCA;
+            // }
+        }
+    }
+    print_info_table();
+
+    // update data from gc_pca to full free page nand
+    printf("=== update data from gc_pca to full free page nand ===\n");
+    gc_pca.fields.block = PHYSICAL_NAND_NUM - GC_NAND_NUM;
+    for(int blockIdx = 0; blockIdx < PHYSICAL_NAND_NUM - GC_NAND_NUM; blockIdx++){
+        if(isBlockHasValid[blockIdx] == 0){
+            for(int pageIdx = 0; pageIdx < MAX_PAGE_NUM; pageIdx++){
+                printf("> %d - %d\n", blockIdx, pageIdx);
+                // update gc_pca
+                gc_pca.fields.page = pageIdx;
+
+                tmp_pca.fields.block = blockIdx;
+                tmp_pca.fields.page = pageIdx;
+
+                if(INFO_TABLE[gc_pca.fields.block][pageIdx] == PAGE_FREE){
+                    break;
+                }
+
+                // copy data from gc_pca full free page nand
+                char buf[512] = {'\0'};
+                nand_read(buf, gc_pca.pca);
+                nand_write(buf, tmp_pca.pca);
+                
+                // update L2P and P2L
+                P2L[tmp_pca.fields.block][tmp_pca.fields.page] = P2L[gc_pca.fields.block][pageIdx];
+                P2L[gc_pca.fields.block][pageIdx] = -1;
+                L2P[P2L[tmp_pca.fields.block][tmp_pca.fields.page]] = tmp_pca.pca;
+                
+                // update info table
+                printf("> from %d - %d to %d - %d.\n",gc_pca.fields.block, gc_pca.fields.page, blockIdx, pageIdx);
+                INFO_TABLE[PHYSICAL_NAND_NUM - GC_NAND_NUM][pageIdx] = PAGE_FREE;
+                INFO_TABLE[tmp_pca.fields.block][tmp_pca.fields.page] = PAGE_VALID;
+
+                print_info_table();
+            }
+            break;
+        }
+    }
+    
+    // Find the first free page in nand, and return it
+    for(int blockIdx = 0; blockIdx < PHYSICAL_NAND_NUM - GC_NAND_NUM; blockIdx++){
+        for(int pageIdx = 0; pageIdx < MAX_PAGE_NUM; pageIdx++){
+            if(INFO_TABLE[blockIdx][pageIdx] == PAGE_FREE){
+                tmp_pca.fields.block = blockIdx;
+                tmp_pca.fields.page = pageIdx;
+                return tmp_pca.pca;
+            }
+        }
+    }
+    
+    // if no free page, return FULL_PCA
+    return FULL_PCA;
 }
 
 static int ftl_read( char* buf, size_t lba)
@@ -259,6 +440,7 @@ static int ftl_write(const char* buf, size_t lba_rnage, size_t lba)
         ){
             // Set old page to invalid.
             INFO_TABLE[oldPca.fields.block][oldPca.fields.page] = PAGE_INVALID;
+            P2L[oldPca.fields.block][oldPca.fields.page] = -1;
         }
 
         // Update L2P Table.
@@ -266,6 +448,7 @@ static int ftl_write(const char* buf, size_t lba_rnage, size_t lba)
 
         // Set new page to valid.
         INFO_TABLE[newPca.fields.block][newPca.fields.page] = PAGE_VALID;
+        P2L[newPca.fields.block][newPca.fields.page] = lba;
 
         print_info_table();
 
@@ -563,14 +746,26 @@ int main(int argc, char* argv[])
 	nand_write_size = 0;
 	host_write_size = 0;
     curr_pca.pca = INVALID_PCA;
+
+    // init curr_gc_pca
+    curr_gc_pca.fields.block = PHYSICAL_NAND_NUM - GC_NAND_NUM;
+    curr_gc_pca.fields.page = 0;
+
     L2P = malloc(LOGICAL_NAND_NUM * NAND_SIZE_KB * 1024 / 512 * sizeof(int));
     memset(L2P, INVALID_PCA, sizeof(int)*LOGICAL_NAND_NUM * NAND_SIZE_KB * 1024 / 512);
+    
 
     // Info Table init
-    INFO_TABLE = malloc(PHYSICAL_NAND_NUM * sizeof(PAGE_INFO*));
+    INFO_TABLE = malloc(PHYSICAL_NAND_NUM * sizeof(int*));
     for(int i = 0; i < PHYSICAL_NAND_NUM; i++){
-        INFO_TABLE[i] = malloc(NAND_SIZE_KB * 1024 / 512 * sizeof(PAGE_INFO));
-        memset(INFO_TABLE[i], PAGE_FREE, NAND_SIZE_KB * 1024 / 512 * sizeof(PAGE_INFO));
+        INFO_TABLE[i] = malloc(NAND_SIZE_KB * 1024 / 512 * sizeof(int));
+        memset(INFO_TABLE[i], PAGE_FREE, NAND_SIZE_KB * 1024 / 512 * sizeof(int));
+    }
+
+    P2L = malloc(PHYSICAL_NAND_NUM * sizeof(int*));
+    for(int i = 0; i < PHYSICAL_NAND_NUM; i++){
+        P2L[i] = malloc(NAND_SIZE_KB * 1024 / 512 * sizeof(int));
+        memset(P2L[i], -1, NAND_SIZE_KB * 1024 / 512 * sizeof(int));
     }
 
     //create nand file
